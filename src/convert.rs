@@ -507,19 +507,16 @@ pub fn elf_to_tbf(
         if last_segment_address_end.is_some() {
             // We have a previous segment. Now, check if there is any padding
             // between the segments in the .elf.
-            let mut padding = segment.paddr as usize - last_segment_address_end.unwrap();
+            let padding = segment.paddr as usize - last_segment_address_end.unwrap();
 
-            if padding > 0 && verbose {
-                println!("  Including padding between segments size={}", padding);
-            }
+            if padding > 0 {
+                if verbose {
+                    println!("  Including padding between segments size={}", padding);
+                }
 
-            // Insert the padding into the generated binary.
-            let zero_buf = [0_u8; 1024];
-            while padding > 0 {
-                let chunk = if padding > 1024 { 1024 } else { padding };
-                binary.extend(&zero_buf[..chunk]);
-                binary_index += chunk;
-                padding -= chunk;
+                // Insert the padding into the generated binary.
+                binary.extend(vec![0; padding]);
+                binary_index += padding;
             }
         }
 
