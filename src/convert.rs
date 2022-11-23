@@ -1,3 +1,5 @@
+//! Convert ELF to TBF.
+
 use crate::header;
 use crate::util::{self, align_to, amount_alignment_needed};
 use ring::{rand, signature};
@@ -51,6 +53,8 @@ pub fn elf_to_tbf(
     rsa4096_public_key: Option<PathBuf>,
 ) -> io::Result<()> {
     let package_name = package_name.unwrap_or_default();
+
+    // Load and parse ELF.
     let elf_file = elf::File::open_stream(input_file).expect("Could not open the .elf file.");
 
     // Adding padding to the end of cortex-m apps. Check for a cortex-m app
@@ -169,6 +173,79 @@ pub fn elf_to_tbf(
             }
         }
         false
+    }
+
+    /// Helper function to determine if a section is within a specific segment.
+    ///
+    /// Based on the function `section_in_segment` in
+    /// https://github.com/eliben/pyelftools
+    fn section_in_segment(
+        section: &elf::types::SectionHeader,
+        segment: &elf::types::ProgramHeader,
+    ) -> bool {
+        let segtype = segment.progtype;
+        let sectype = section.shtype;
+        let secflags = section.flags.0;
+
+        // Only PT_LOAD, PT_GNU_RELRO and PT_TLS segments can contain SHF_TLS
+        // sections.
+        if (secflags & elf::types::SHF_TLS.0 > 0)
+            && (segtype == elf::types::PT_TLS
+                || segtype == elf::types::PT_GNU_RELRO
+                || segtype == elf::types::PT_LOAD)
+        {
+            // OK
+        } else if (secflags & elf::types::SHF_TLS.0 == 0)
+            && !(segtype == elf::types::PT_TLS || segtype == elf::types::PT_GNU_RELRO)
+        {
+            // OK
+        } else {
+            return false;
+        }
+
+        // PT_LOAD and similar segments only have SHF_ALLOC sections.
+        if (secflags & elf::types::SHF_ALLOC.0 == 0)
+            && (segtype == elf::types::PT_LOAD
+                || segtype == elf::types::PT_DYNAMIC
+                || segtype == elf::types::PT_GNU_EH_FRAME
+                || segtype == elf::types::PT_GNU_RELRO
+                || segtype == elf::types::PT_GNU_STACK)
+        {
+            return false;
+        }
+
+        // In ELF_SECTION_IN_SEGMENT_STRICT the flag check_vma is on, so if this
+        // is an alloc section, check whether its VMA is in bounds.
+        if secflags & elf::types::SHF_ALLOC.0 > 0 {
+            let secaddr = section.addr;
+            let vaddr = segment.vaddr;
+
+            // This checks that the section is wholly contained in the segment.
+            // The third condition is the 'strict' one - an empty section will
+            // not match at the very end of the segment (unless the segment is
+            // also zero size, which is handled by the second condition).
+            if !(secaddr >= vaddr
+                && secaddr - vaddr + section.size <= segment.memsz
+                && secaddr - vaddr <= segment.memsz - 1)
+            {
+                return false;
+            }
+        }
+
+        // If we've come this far and it's a NOBITS section, it's in the
+        // segment.
+        if sectype == elf::types::SHT_NOBITS {
+            return true;
+        }
+
+        let secoffset = section.offset;
+        let poffset = segment.offset;
+
+        // Same logic as with secaddr vs. vaddr checks above, just on offsets in
+        // the file.
+        return secoffset >= poffset
+            && secoffset - poffset + section.size <= segment.filesz
+            && secoffset - poffset <= segment.filesz - 1;
     }
 
     // Do flash address.
@@ -412,6 +489,8 @@ pub fn elf_to_tbf(
             continue;
         }
 
+        println!("segment offset:{}", segment.offset);
+
         // Insert padding between segments if needed.
         if last_segment_address_end.is_some() {
             // We have a previous segment. Now, check if there is any padding
@@ -476,35 +555,43 @@ pub fn elf_to_tbf(
                 continue;
             }
 
-            // Check if this section is within the segment based on its offset
-            // in the file.
-            if section.shdr.offset >= segment.offset
-                && section.shdr.offset < (segment.offset + segment.filesz)
-            {
+            // Check if this section is within the segment.
+            if section_in_segment(&section.shdr, segment) {
                 // This section is in this segment.
+                //
+                println!(
+                    "section {} flags {:#x}",
+                    section.shdr.name, section.shdr.flags.0
+                );
 
-                // First, determine if there is a ".rel.<section name>" section
-                // that we need to include in the relocation data.
+                // First, determine if we need to check for relocation data for
+                // this section. The section must be marked `SHF_WRITE`, as to
+                // use the relocations at runtime requires being able to update
+                // the contents of the section.
+                if section.shdr.flags.0 & elf::types::SHF_WRITE.0 > 0 {
+                    // Then check if there is a ".rel.<section name>" section
+                    // that we need to include in the relocation data.
 
-                // relocation_section_name = ".rel" + section_name
-                let mut relocation_section_name: String = ".rel".to_owned();
-                relocation_section_name.push_str(&section.shdr.name);
+                    // relocation_section_name = ".rel" + section_name
+                    let mut relocation_section_name: String = ".rel".to_owned();
+                    relocation_section_name.push_str(&section.shdr.name);
 
-                // Get the contents of the relocation data if it exists and add
-                // that data to a buffer of relocation data.
-                let rel_data = elf_file
-                    .sections
-                    .iter()
-                    .find(|section| section.shdr.name == relocation_section_name)
-                    .map_or(&[] as &[u8], |section| section.data.as_ref());
-                relocation_binary.extend(rel_data);
+                    // Get the contents of the relocation data if it exists and
+                    // add that data to a buffer of relocation data.
+                    let rel_data = elf_file
+                        .sections
+                        .iter()
+                        .find(|section| section.shdr.name == relocation_section_name)
+                        .map_or(&[] as &[u8], |section| section.data.as_ref());
+                    relocation_binary.extend(rel_data);
 
-                if verbose && !rel_data.is_empty() {
-                    println!(
-                        "  Including relocation data ({0}). Length: {1} ({1:#x}) bytes.",
-                        relocation_section_name,
-                        rel_data.len(),
-                    );
+                    if verbose && !rel_data.is_empty() {
+                        println!(
+                            "  Including relocation data ({0}). Length: {1} ({1:#x}) bytes.",
+                            relocation_section_name,
+                            rel_data.len(),
+                        );
+                    }
                 }
 
                 // Second, check if this is a writeable flash region and if so,
