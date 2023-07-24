@@ -509,6 +509,17 @@ pub fn elf_to_tbf(
                 // start address to be at a 256 byte alignment.
                 let app_binary_address = fixed_address_flash.unwrap_or(0); // Already checked for `None`.
                 let tbf_start_address = util::align_down(app_binary_address, 256);
+
+                if verbose {
+                    println!("Estimating a suitable protected region size.");
+                    println!("  App binary address: {:#02x}", app_binary_address);
+                    println!("  TBF start address:  {:#02x}", tbf_start_address);
+                    println!(
+                        "  Protection region size: {} bytes",
+                        app_binary_address - tbf_start_address
+                    );
+                }
+
                 app_binary_address - tbf_start_address
             } else {
                 // Normal PIC case, no need to insert extra protected region.
